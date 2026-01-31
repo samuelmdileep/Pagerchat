@@ -54,10 +54,7 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
-    
-    // 🔥 FIX: Register that we are currently looking at THIS chat
     currentOpenChatId = widget.chatId;
-
     _loadMessages();
     _listenToFirebase();
     _updateChatPreview(lastText: "", unread: false);
@@ -65,7 +62,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
-    // 🔥 FIX: Deregister this chat when we leave
     if (currentOpenChatId == widget.chatId) {
       currentOpenChatId = null;
     }
@@ -83,6 +79,30 @@ class _ChatScreenState extends State<ChatScreen> {
     super.dispose();
   }
 
+  // ===================== DATE FORMATTER =====================
+  String _formatDateLabel(String dateKey) {
+    try {
+      final now = DateTime.now();
+      final today = DateTime(now.year, now.month, now.day);
+      
+      final parts = dateKey.split('-');
+      final date = DateTime(
+        int.parse(parts[0]), 
+        int.parse(parts[1]), 
+        int.parse(parts[2])
+      );
+      
+      final check = DateTime(date.year, date.month, date.day);
+
+      if (check == today) return "TODAY";
+      if (check == today.subtract(const Duration(days: 1))) return "YESTERDAY";
+      
+      return "${parts[2]}/${parts[1]}/${parts[0]}"; // DD/MM/YYYY
+    } catch (e) {
+      return dateKey;
+    }
+  }
+
   // ===================== STORAGE =====================
   Future<void> _loadMessages() async {
     final prefs = await SharedPreferences.getInstance();
@@ -97,22 +117,10 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   //================= UI HELPERS =====================
-
-  Widget _optionTile(
-    String text,
-    IconData icon,
-    VoidCallback onTap, {
-    Color color = Colors.redAccent,
-  }) {
+  Widget _optionTile(String text, IconData icon, VoidCallback onTap, {Color color = Colors.redAccent}) {
     return ListTile(
       leading: Icon(icon, color: color),
-      title: Text(
-        text,
-        style: TextStyle(
-          color: color,
-          fontFamily: 'monospace',
-        ),
-      ),
+      title: Text(text, style: TextStyle(color: color, fontFamily: 'monospace')),
       onTap: onTap,
     );
   }
@@ -131,36 +139,22 @@ class _ChatScreenState extends State<ChatScreen> {
       builder: (_) => Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          _optionTile(
-            "Delete for me",
-            Icons.delete_outline,
-            () {
-              Navigator.pop(context);
-              _scheduleDelete(messageId, forEveryone: false);
-            },
-          ),
+          _optionTile("Delete for me", Icons.delete_outline, () {
+            Navigator.pop(context);
+            _scheduleDelete(messageId, forEveryone: false);
+          }),
           if (isYou)
-            _optionTile(
-              "Delete for everyone",
-              Icons.delete,
-              () {
-                Navigator.pop(context);
-                _scheduleDelete(messageId, forEveryone: true);
-              },
-            ),
-          _optionTile(
-            "Cancel",
-            Icons.close,
-            () => Navigator.pop(context),
-            color: Colors.green,
-          ),
+            _optionTile("Delete for everyone", Icons.delete, () {
+              Navigator.pop(context);
+              _scheduleDelete(messageId, forEveryone: true);
+            }),
+          _optionTile("Cancel", Icons.close, () => Navigator.pop(context), color: Colors.green),
         ],
       ),
     );
   }
 
   //===================== DELETE LOGIC ===================
-
   void _scheduleDelete(String messageId, {required bool forEveryone}) {
     setState(() => _pendingDeletes.add(messageId));
 
@@ -221,11 +215,7 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  // ===================== CHAT LIST PREVIEW =====================
-  Future<void> _updateChatPreview({
-    required String lastText,
-    required bool unread,
-  }) async {
+  Future<void> _updateChatPreview({required String lastText, required bool unread}) async {
     final prefs = await SharedPreferences.getInstance();
     if (lastText.isNotEmpty) {
       await prefs.setString("chat_${widget.chatId}_last", lastText);
@@ -250,6 +240,14 @@ class _ChatScreenState extends State<ChatScreen> {
 
         final cleanText = (data["text"] ?? "").toString().replaceAll("|", " ");
 
+        // 🔥 1. EXTRACT DATE KEY FOR HEADERS
+        String dateKey = "TODAY";
+        if (data["timestamp"] != null && data["timestamp"] is Timestamp) {
+          final dt = (data["timestamp"] as Timestamp).toDate();
+          dateKey = "${dt.year}-${dt.month}-${dt.day}";
+        }
+
+        // 🔥 2. STORE DATE KEY (Index 7)
         final msg =
             "$docId|"
             "$cleanText|"
@@ -257,7 +255,8 @@ class _ChatScreenState extends State<ChatScreen> {
             "${data["time"]}|"
             "${data["status"]}|"
             "${deletedForEveryone ? 1 : 0}|"
-            "${deletedForMe ? 1 : 0}";
+            "${deletedForMe ? 1 : 0}|"
+            "$dateKey";
 
         final index = _messages.indexWhere((m) => m.startsWith("$docId|"));
 
@@ -298,25 +297,28 @@ class _ChatScreenState extends State<ChatScreen> {
 
     _controller.clear();
 
-    final chatRef =
-        FirebaseFirestore.instance.collection("chats").doc(widget.chatId);
+    final chatRef = FirebaseFirestore.instance.collection("chats").doc(widget.chatId);
 
+    // 🔥 PREPARE TIME DATA
+    final now = DateTime.now();
+    final timeString = "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}";
+    final timeValue = now.hour * 60 + now.minute; 
+
+    // Update main Chat list
     await chatRef.set({
       "users": [widget.myId, otherUserId],
       "lastUpdated": FieldValue.serverTimestamp(),
       "lastMessage": text.toUpperCase(),
       "lastSender": widget.myId,
-      "lastTime": "${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}",
+      "lastTime": timeString,
+      "lastTimeValue": timeValue, 
     }, SetOptions(merge: true));
 
-    final now = DateTime.now();
-    final time =
-        "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}";
-
+    // Add Message
     await chatRef.collection("messages").add({
       "text": text.toUpperCase(),
       "sender": widget.myId,
-      "time": time,
+      "time": timeString,
       "status": "DELIVERED",
       "timestamp": FieldValue.serverTimestamp(),
     });
@@ -343,6 +345,8 @@ class _ChatScreenState extends State<ChatScreen> {
       key: _scaffoldMessengerKey,
       child: Scaffold(
         backgroundColor: Colors.black,
+        // 🔥 Fix: Push layout up when keyboard opens
+        resizeToAvoidBottomInset: true,
         appBar: AppBar(
           backgroundColor: Colors.black,
           elevation: 0,
@@ -356,10 +360,7 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           bottom: PreferredSize(
             preferredSize: const Size.fromHeight(1),
-            child: Container(
-              height: 1,
-              color: Colors.greenAccent.withOpacity(0.2),
-            ),
+            child: Container(height: 1, color: Colors.greenAccent.withOpacity(0.2)),
           ),
         ),
         body: Column(
@@ -377,125 +378,154 @@ class _ChatScreenState extends State<ChatScreen> {
                   final text = parts[1];
                   final sender = parts[2];
                   final time = parts[3];
-                  final status = parts[4];
+                  // final status = parts[4]; 
 
-                  final isDeletedForEveryone =
-                      parts.length > 5 && parts[5] == "1";
+                  final isDeletedForEveryone = parts.length > 5 && parts[5] == "1";
                   final isDeletedForMe = parts.length > 6 && parts[6] == "1";
 
-                  if (_pendingDeletes.contains(messageId) ||
-                      isDeletedForEveryone ||
-                      isDeletedForMe) {
+                  // 🔥 3. GET DATE KEY (Fallback to TODAY if missing)
+                  final dateKey = parts.length > 7 ? parts[7] : "TODAY";
+
+                  // 🔥 4. CALCULATE DATE HEADER
+                  bool showDateHeader = false;
+                  if (index == 0) {
+                    showDateHeader = true;
+                  } else {
+                    final prevParts = _messages[index - 1].split('|');
+                    final prevDateKey = prevParts.length > 7 ? prevParts[7] : "TODAY";
+                    if (dateKey != prevDateKey) {
+                      showDateHeader = true;
+                    }
+                  }
+
+                  if (_pendingDeletes.contains(messageId) || isDeletedForEveryone || isDeletedForMe) {
                     return const SizedBox();
                   }
 
                   final isYou = sender == widget.myId;
                   final baseColor = isYou ? Colors.greenAccent : Colors.green;
 
-                  return Align(
-                    alignment:
-                        isYou ? Alignment.centerRight : Alignment.centerLeft,
-                    child: GestureDetector(
-                      onLongPress: () {
-                        _showMessageOptions(
-                          context: context,
-                          messageId: messageId, 
-                          isYou: isYou,
-                        );
-                      },
-                      child: Container(
-                        margin: const EdgeInsets.symmetric(vertical: 5),
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 14, vertical: 10),
-                        constraints: const BoxConstraints(maxWidth: 300),
-                        decoration: BoxDecoration(
-                          color: baseColor.withOpacity(0.12),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(
-                            color: baseColor.withOpacity(0.8),
-                            width: 1.1,
+                  return Column(
+                    children: [
+                      // 🔥 5. RENDER DATE HEADER
+                      if (showDateHeader)
+                        Container(
+                          margin: const EdgeInsets.symmetric(vertical: 16),
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF0F140F),
+                            borderRadius: BorderRadius.circular(20),
+                            border: Border.all(color: Colors.greenAccent.withOpacity(0.3)),
                           ),
-                          boxShadow: [
-                            BoxShadow(
-                              color: baseColor.withOpacity(0.12),
-                              blurRadius: 6,
-                              offset: const Offset(0, 2),
+                          child: Text(
+                            _formatDateLabel(dateKey),
+                            style: TextStyle(
+                              color: Colors.greenAccent.withOpacity(0.8),
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              fontFamily: 'monospace',
                             ),
-                          ],
+                          ),
                         ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.end,
-                          children: [
-                            Text(
-                              text,
-                              style: const TextStyle(
-                                color: Colors.greenAccent,
-                                fontFamily: 'monospace',
-                                fontSize: 14,
-                                height: 1.3,
-                              ),
-                            ),
-                            const SizedBox(height: 6),
-                            Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Text(
-                                  time,
-                                  style: TextStyle(
-                                    color: Colors.greenAccent.withOpacity(0.55),
-                                    fontSize: 11,
-                                  ),
+
+                      Align(
+                        alignment: isYou ? Alignment.centerRight : Alignment.centerLeft,
+                        child: GestureDetector(
+                          onLongPress: () {
+                            _showMessageOptions(context: context, messageId: messageId, isYou: isYou);
+                          },
+                          // 🔥 6. RIGHT CLICK SUPPORT (Web)
+                          onSecondaryTap: () {
+                            _showMessageOptions(context: context, messageId: messageId, isYou: isYou);
+                          },
+                          child: Container(
+                            margin: const EdgeInsets.symmetric(vertical: 5),
+                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                            constraints: const BoxConstraints(maxWidth: 300),
+                            decoration: BoxDecoration(
+                              color: baseColor.withOpacity(0.12),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: baseColor.withOpacity(0.8), width: 1.1),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: baseColor.withOpacity(0.12),
+                                  blurRadius: 6,
+                                  offset: const Offset(0, 2),
                                 ),
-                                if (isYou) ...[
-                                  const SizedBox(width: 6),
-                                  Icon(
-                                    Icons.done_all,
-                                    size: 13,
-                                    color: Colors.greenAccent.withOpacity(0.6),
-                                  ),
-                                ],
                               ],
                             ),
-                          ],
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                Text(
+                                  text,
+                                  style: const TextStyle(
+                                    color: Colors.greenAccent,
+                                    fontFamily: 'monospace',
+                                    fontSize: 14,
+                                    height: 1.3,
+                                  ),
+                                ),
+                                const SizedBox(height: 6),
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(
+                                      time,
+                                      style: TextStyle(
+                                        color: Colors.greenAccent.withOpacity(0.55),
+                                        fontSize: 11,
+                                      ),
+                                    ),
+                                    if (isYou) ...[
+                                      const SizedBox(width: 6),
+                                      Icon(
+                                        Icons.done_all,
+                                        size: 13,
+                                        color: Colors.greenAccent.withOpacity(0.6),
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
                         ),
                       ),
-                    ),
+                    ],
                   );
                 },
               ),
             ),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-              decoration: BoxDecoration(
-                color: const Color(0xFF060906),
-                border: Border(
-                  top: BorderSide(
-                    color: Colors.greenAccent.withOpacity(0.25),
-                  ),
+            // 🔥 Fix: Safe Area for input
+            SafeArea(
+              top: false,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF060906),
+                  border: Border(top: BorderSide(color: Colors.greenAccent.withOpacity(0.25))),
                 ),
-              ),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _controller,
-                      onSubmitted: (_) => sendMessage(),
-                      style: const TextStyle(
-                        color: Colors.greenAccent,
-                        fontFamily: 'monospace',
-                      ),
-                      decoration: const InputDecoration(
-                        hintText: "TYPE MESSAGE",
-                        hintStyle: TextStyle(color: Colors.green),
-                        border: InputBorder.none,
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _controller,
+                        onSubmitted: (_) => sendMessage(),
+                        style: const TextStyle(color: Colors.greenAccent, fontFamily: 'monospace'),
+                        decoration: const InputDecoration(
+                          hintText: "TYPE MESSAGE",
+                          hintStyle: TextStyle(color: Colors.green),
+                          border: InputBorder.none,
+                        ),
                       ),
                     ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.send, color: Colors.greenAccent),
-                    onPressed: sendMessage,
-                  ),
-                ],
+                    IconButton(
+                      icon: const Icon(Icons.send, color: Colors.greenAccent),
+                      onPressed: sendMessage,
+                    ),
+                  ],
+                ),
               ),
             ),
           ],

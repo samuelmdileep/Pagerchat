@@ -7,8 +7,9 @@ import 'auth_screen.dart';
 import 'chat_list_screen.dart';
 import 'auth_service.dart';
 import 'verify_email_screen.dart';
+import 'notification_helper.dart'; // 🔥 ADDED THIS IMPORT
 
-// ✅ CONDITIONAL IMPORT (THIS IS THE KEY)
+// ✅ CONDITIONAL IMPORT
 import 'web_context_menu.dart'
     if (dart.library.html) 'web_context_menu_web.dart';
 
@@ -19,7 +20,10 @@ void main() async {
     options: DefaultFirebaseOptions.currentPlatform,
   );
 
-  // 🔥 Disable browser right-click (WEB ONLY, SAFE)
+  // 🔥 Initialize Notifications (CRITICAL STEP ADDED)
+  await NotificationHelper.init();
+
+  // 🔥 Disable browser right-click (WEB ONLY)
   disableWebContextMenu();
 
   runApp(const PagerChatApp());
@@ -32,7 +36,11 @@ class PagerChatApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark(),
+      title: 'Pager Chat', // Added title for browser tab
+      theme: ThemeData.dark().copyWith(
+        // Optional: Ensure the background is truly black for your retro look
+        scaffoldBackgroundColor: Colors.black, 
+      ),
       home: const AuthGate(),
     );
   }

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // Import for Clipboard
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'chat_screen.dart'; // Import to access currentOpenChatId
@@ -22,6 +23,7 @@ class _ChatListScreenState extends State<ChatListScreen>
   final List<Map<String, String>> chats = []; // saved contacts
   final List<Map<String, String>> unknownChats = []; // unsaved chats
 
+  // Cache stores text, sender, timestamp (for sorting), AND timeLabel (for display)
   final Map<String, dynamic> _lastMessageCache = {};
 
   String _search = "";
@@ -34,7 +36,7 @@ class _ChatListScreenState extends State<ChatListScreen>
   @override
   void initState() {
     super.initState();
-    
+
     // Init local notifications
     NotificationHelper.init();
 
@@ -48,49 +50,110 @@ class _ChatListScreenState extends State<ChatListScreen>
       end: 0.9,
     ).animate(_pulseController);
 
-    _loadContacts();
-    _discoverChatsFromChatIds();
+    // Load contacts, then start listening to ensure less flicker
+    _loadContacts().then((_) {
+      if (mounted) setState(() {});
+    });
+    
+    _listenToFirebase();
+  }
 
-    // 🔥 MAIN LISTENER (Updates list & Triggers Notifications)
+  // ===================== FIREBASE LISTENER =====================
+  void _listenToFirebase() {
     FirebaseFirestore.instance
         .collection("chats")
         .where("users", arrayContains: widget.myId)
         .snapshots()
         .listen((snapshot) {
       
+      // 1. Notification Logic
       for (final change in snapshot.docChanges) {
-        final data = change.doc.data()!;
-        final chatId = change.doc.id;
-        
-        // 1. Update Cache
-        if (data.containsKey('lastMessage')) {
-           _lastMessageCache[chatId] = {
-             "text": data['lastMessage'],
-             "sender": data['lastSender'],
-             "time": data['lastTime'],
-           };
-        }
+        if (change.type == DocumentChangeType.modified ||
+            change.type == DocumentChangeType.added) {
+          
+          final data = change.doc.data();
+          if (data == null) continue;
 
-        // 2. 🔥 TRIGGER NOTIFICATION
-        // Only if modified/added, sender is NOT me, and NOT currently open
-        if (change.type == DocumentChangeType.modified || change.type == DocumentChangeType.added) {
           final lastSender = data['lastSender'];
           final lastMsg = data['lastMessage'] ?? "New Message";
-          final lastUpdated = (data['lastUpdated'] as Timestamp?)?.toDate();
+          
+          dynamic rawUpdated = data['lastUpdated'];
+          final lastUpdatedDate = (rawUpdated is Timestamp) ? rawUpdated.toDate() : null;
 
-          // Check for "recent" (avoid spam on initial load)
-          final isRecent = lastUpdated != null && 
-              DateTime.now().difference(lastUpdated).inSeconds < 10;
+          final isRecent = lastUpdatedDate != null &&
+              DateTime.now().difference(lastUpdatedDate).inSeconds < 10;
 
-          if (isRecent && lastSender != widget.myId && currentOpenChatId != chatId) {
-             NotificationHelper.showNotification(
-               title: "New Page from $lastSender",
-               body: lastMsg,
-               channelId: chatId,
-             );
+          if (isRecent &&
+              lastSender != widget.myId &&
+              currentOpenChatId != change.doc.id) {
+            NotificationHelper.showNotification(
+              title: "New Page from $lastSender",
+              body: lastMsg,
+              channelId: change.doc.id,
+            );
           }
         }
       }
+
+      // 2. Rebuild Cache & Unknown List
+      final Set<String> activeChatIds = {};
+      unknownChats.clear(); // Clear to rebuild
+
+      for (final doc in snapshot.docs) {
+        final data = doc.data();
+        final chatId = doc.id;
+        activeChatIds.add(chatId);
+
+        // --- A. CACHE UPDATE ---
+        if (data.containsKey('lastMessage')) {
+          dynamic rawUpdated = data['lastUpdated'];
+          Timestamp? sortTimestamp = (rawUpdated is Timestamp) ? rawUpdated : null;
+
+          String displayTime = "";
+          if (sortTimestamp != null) {
+            final date = sortTimestamp.toDate();
+            final now = DateTime.now();
+            final today = DateTime(now.year, now.month, now.day);
+            final msgDate = DateTime(date.year, date.month, date.day);
+
+            if (msgDate == today) {
+              displayTime = "${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}";
+            } else if (msgDate == today.subtract(const Duration(days: 1))) {
+              displayTime = "YESTERDAY";
+            } else {
+              displayTime = "${date.day.toString().padLeft(2, '0')}/${date.month.toString().padLeft(2, '0')}/${date.year.toString().substring(2)}";
+            }
+          }
+
+          _lastMessageCache[chatId] = {
+            "text": data['lastMessage'],
+            "sender": data['lastSender'],
+            "timestamp": sortTimestamp,
+            "timeLabel": displayTime,
+          };
+        }
+
+        // --- B. UNKNOWN CHAT DISCOVERY ---
+        final parts = chatId.split("_");
+        if (parts.length == 2 && parts.contains(widget.myId)) {
+          final otherId = parts.first == widget.myId ? parts.last : parts.first;
+          
+          // Note: This check relies on 'chats' being loaded. 
+          // If 'chats' loads LATER, this might add a duplicate temporarily.
+          // 🔥 The build() method fixes this visual duplicate.
+          final isSavedContact = chats.any((c) => c["id"] == otherId);
+          if (!isSavedContact) {
+            unknownChats.add({
+              "name": "UNKNOWN",
+              "id": otherId,
+            });
+          }
+        }
+      }
+
+      // 3. Cleanup Cache
+      _lastMessageCache.removeWhere((key, value) => !activeChatIds.contains(key));
+
       if (mounted) setState(() {});
     });
   }
@@ -105,27 +168,51 @@ class _ChatListScreenState extends State<ChatListScreen>
 
   // ===================== CONTACT STORAGE =====================
   Future<void> _loadContacts() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getStringList("contacts_${widget.myId}") ?? [];
+    try {
+      final snapshot = await FirebaseFirestore.instance
+          .collection("users")
+          .doc(widget.myId)
+          .collection("saved_contacts")
+          .get();
 
-    setState(() {
-      chats.clear();
-      for (final e in raw) {
-        final parts = e.split("|");
-        if (parts.length == 2) {
-          chats.add({"name": parts[0], "id": parts[1]});
+      setState(() {
+        chats.clear();
+        for (final doc in snapshot.docs) {
+          final data = doc.data();
+          chats.add({
+            "name": data["name"].toString(),
+            "id": data["id"].toString(),
+          });
         }
-      }
+      });
+    } catch (e) {
+      debugPrint("Error loading contacts: $e");
+    }
+  }
+
+  Future<void> _addContactToFirestore(String id, String name) async {
+    await FirebaseFirestore.instance
+        .collection("users")
+        .doc(widget.myId)
+        .collection("saved_contacts")
+        .doc(id)
+        .set({
+      "name": name,
+      "id": id,
+      "savedAt": FieldValue.serverTimestamp(),
     });
   }
 
-  Future<void> _saveContacts() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = chats.map((c) => "${c['name']}|${c['id']}").toList();
-    await prefs.setStringList("contacts_${widget.myId}", raw);
+  Future<void> _deleteContactFromFirestore(String id) async {
+    await FirebaseFirestore.instance
+        .collection("users")
+        .doc(widget.myId)
+        .collection("saved_contacts")
+        .doc(id)
+        .delete();
   }
 
-  //==================== save CONTACT =====================
+  //==================== SAVE CONTACT =====================
   void _openSaveContactDialog(String pagerId) {
     final nameController = TextEditingController();
     String error = "";
@@ -197,10 +284,11 @@ class _ChatListScreenState extends State<ChatListScreen>
                     "name": name.toUpperCase(),
                     "id": pagerId,
                   });
+                  // Immediately clean up unknown list
                   unknownChats.removeWhere((c) => c["id"] == pagerId);
                 });
 
-                await _saveContacts();
+                await _addContactToFirestore(pagerId, name.toUpperCase());
                 Navigator.pop(context);
               },
               child: const Text(
@@ -224,6 +312,20 @@ class _ChatListScreenState extends State<ChatListScreen>
   //========================== EDIT CONTACT ==========================
   void _openEditContactDialog(Map<String, String> chat) {
     final nameController = TextEditingController(text: chat["name"]);
+
+    void copyToClipboard() {
+      Clipboard.setData(ClipboardData(text: chat["id"]!));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Pager ID Copied to Clipboard",
+            style: TextStyle(color: Colors.black),
+          ),
+          backgroundColor: Colors.greenAccent,
+          duration: Duration(milliseconds: 800),
+        ),
+      );
+    }
 
     showDialog(
       context: context,
@@ -257,19 +359,24 @@ class _ChatListScreenState extends State<ChatListScreen>
               ),
             ),
             const SizedBox(height: 12),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                border: Border.all(color: Colors.green),
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: Text(
-                "PAGER ID: ${chat["id"]}",
-                style: const TextStyle(
-                  color: Colors.green,
-                  fontSize: 13,
-                  letterSpacing: 1,
+            GestureDetector(
+              onLongPress: copyToClipboard,
+              onSecondaryTap: copyToClipboard,
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.green),
+                  borderRadius: BorderRadius.circular(10),
+                  color: Colors.green.withOpacity(0.1),
+                ),
+                child: Text(
+                  "PAGER ID: ${chat["id"]}",
+                  style: const TextStyle(
+                    color: Colors.green,
+                    fontSize: 13,
+                    letterSpacing: 1,
+                  ),
                 ),
               ),
             ),
@@ -286,7 +393,7 @@ class _ChatListScreenState extends State<ChatListScreen>
                 chats[index]["name"] = newName.toUpperCase();
               });
 
-              await _saveContacts();
+              await _addContactToFirestore(chat["id"]!, newName.toUpperCase());
               Navigator.pop(context);
             },
             child: const Text(
@@ -306,28 +413,181 @@ class _ChatListScreenState extends State<ChatListScreen>
     );
   }
 
-  // ===================== DISCOVER CHATS =====================
-  Future<void> _discoverChatsFromChatIds() async {
-    final snap = await FirebaseFirestore.instance.collection("chats").get();
+  // ===================== DELETE CONFIRMATION DIALOG =====================
+  void _confirmDeleteChat(String chatId) {
+    bool deleteForEveryone = false;
 
-    for (final doc in snap.docs) {
-      final chatId = doc.id;
-      final parts = chatId.split("_");
-      if (parts.length != 2) continue;
-      if (!parts.contains(widget.myId)) continue;
+    showDialog(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          backgroundColor: Colors.black,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+            side: BorderSide(color: Colors.redAccent.withOpacity(0.5)),
+          ),
+          title: const Text(
+            "DELETE CHAT",
+            style: TextStyle(color: Colors.redAccent),
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                "Are you sure you want to delete this chat?",
+                style: TextStyle(color: Colors.green, fontSize: 16),
+              ),
+              const SizedBox(height: 20),
+              GestureDetector(
+                onTap: () {
+                  setDialogState(() {
+                    deleteForEveryone = !deleteForEveryone;
+                  });
+                },
+                child: Row(
+                  children: [
+                    Container(
+                      width: 24,
+                      height: 24,
+                      decoration: BoxDecoration(
+                        color: deleteForEveryone
+                            ? Colors.redAccent
+                            : Colors.transparent,
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: Colors.redAccent),
+                      ),
+                      child: deleteForEveryone
+                          ? const Icon(Icons.check,
+                              size: 16, color: Colors.black)
+                          : null,
+                    ),
+                    const SizedBox(width: 12),
+                    const Text(
+                      "Delete for everyone",
+                      style: TextStyle(
+                        color: Colors.redAccent,
+                        fontSize: 14,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text("CANCEL", style: TextStyle(color: Colors.green)),
+            ),
+            TextButton(
+              onPressed: () async {
+                Navigator.pop(context); // Close dialog
+                await _performDelete(chatId, deleteForEveryone);
+              },
+              child: const Text(
+                "DELETE",
+                style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
-      final otherId = parts.first == widget.myId ? parts.last : parts.first;
-      final existsInSaved = chats.any((c) => c["id"] == otherId);
-      final existsInUnknown = unknownChats.any((c) => c["id"] == otherId);
+  // ===================== PERFORM DELETE LOGIC =====================
+  Future<void> _performDelete(String chatId, bool forEveryone) async {
+    final chatRef = FirebaseFirestore.instance.collection("chats").doc(chatId);
 
-      if (!existsInSaved && !existsInUnknown) {
-        unknownChats.add({
-          "name": "UNKNOWN",
-          "id": otherId,
-        });
+    // 🔥 Wipe Local Storage
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove("chat_$chatId"); 
+    await prefs.remove("chat_${chatId}_last"); 
+    await prefs.remove("chat_${chatId}_unread"); 
+
+    if (forEveryone) {
+      final messages = await chatRef.collection("messages").get();
+      final batch = FirebaseFirestore.instance.batch();
+      
+      for (var doc in messages.docs) {
+        batch.delete(doc.reference);
       }
+      batch.delete(chatRef);
+      
+      await batch.commit();
+    } else {
+      await chatRef.update({
+        "users": FieldValue.arrayRemove([widget.myId])
+      });
     }
-    if (mounted) setState(() {});
+
+    setState(() {
+      _lastMessageCache.remove(chatId);
+    });
+  }
+
+  // ===================== CHAT OPTIONS =====================
+  void _showChatOptions({required Map<String, String> chat}) {
+    final isSaved = chats.any((c) => c["id"] == chat["id"]);
+    final fullChatId = _buildChatId(widget.myId, chat["id"]!);
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (_) => Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          color: Colors.black,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+          border: Border.all(color: Colors.greenAccent, width: 1.5),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(chat["name"]!,
+                style: const TextStyle(
+                    color: Colors.greenAccent,
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold)),
+            const SizedBox(height: 16),
+            if (!isSaved)
+              _optionTile("Save to Contacts", Icons.person_add, () {
+                Navigator.pop(context);
+                _openSaveContactDialog(chat["id"]!);
+              }),
+            if (isSaved)
+              _optionTile("Edit Contact", Icons.edit, () {
+                Navigator.pop(context);
+                _openEditContactDialog(chat);
+              }),
+            _optionTile("Delete Chat", Icons.delete, () {
+              Navigator.pop(context);
+              _confirmDeleteChat(fullChatId);
+            }, color: Colors.redAccent),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _optionTile(String text, IconData icon, VoidCallback onTap,
+      {Color color = Colors.greenAccent}) {
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        child: Row(
+          children: [
+            Icon(icon, color: color),
+            const SizedBox(width: 12),
+            Text(text, style: TextStyle(color: color, fontSize: 16)),
+          ],
+        ),
+      ),
+    );
   }
 
   // ===================== ADD CONTACT =====================
@@ -341,6 +601,10 @@ class _ChatListScreenState extends State<ChatListScreen>
       builder: (_) => StatefulBuilder(
         builder: (context, setLocalState) => AlertDialog(
           backgroundColor: Colors.black,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+            side: BorderSide(color: Colors.greenAccent.withOpacity(0.5)),
+          ),
           title: const Text(
             "ADD CONTACT",
             style: TextStyle(color: Colors.greenAccent),
@@ -369,7 +633,7 @@ class _ChatListScreenState extends State<ChatListScreen>
                 Padding(
                   padding: const EdgeInsets.only(top: 8),
                   child: Text(error,
-                      style: const TextStyle(color: Colors.red)),
+                      style: const TextStyle(color: Colors.redAccent)),
                 ),
             ],
           ),
@@ -413,86 +677,12 @@ class _ChatListScreenState extends State<ChatListScreen>
                   unknownChats.removeWhere((c) => c["id"] == pagerId);
                 });
 
-                await _saveContacts();
-                Navigator.pop(context);
+                await _addContactToFirestore(pagerId, name.toUpperCase());
+                if (mounted) Navigator.pop(context);
               },
               child: const Text("SAVE",
                   style: TextStyle(color: Colors.greenAccent)),
             )
-          ],
-        ),
-      ),
-    );
-  }
-
-  // ===================== HELPERS =====================
-  String _buildChatId(String a, String b) =>
-      a.compareTo(b) < 0 ? "${a}_$b" : "${b}_$a";
-
-  Future<bool> _isUnread(String chatId) async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getBool("chat_${chatId}_unread") ?? false;
-  }
-
-  // ===================== CHAT OPTIONS =====================
-  void _showChatOptions({required Map<String, String> chat}) {
-    final isSaved = chats.any((c) => c["id"] == chat["id"]);
-
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (_) => Container(
-        width: double.infinity,
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(
-          color: Colors.black,
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
-          border: Border.all(color: Colors.greenAccent, width: 1.5),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(chat["name"]!,
-                style: const TextStyle(
-                    color: Colors.greenAccent,
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold)),
-            const SizedBox(height: 16),
-            if (!isSaved)
-              _optionTile("Save to Contacts", Icons.person_add, () {
-                Navigator.pop(context);
-                _openSaveContactDialog(chat["id"]!);
-              }),
-            if (isSaved)
-              _optionTile("Edit Contact", Icons.edit, () {
-                Navigator.pop(context);
-                _openEditContactDialog(chat);
-              }),
-            _optionTile("Delete", Icons.delete, () async {
-              chats.removeWhere((c) => c["id"] == chat["id"]);
-              unknownChats.removeWhere((c) => c["id"] == chat["id"]);
-              await _saveContacts();
-              setState(() {});
-              Navigator.pop(context);
-            }, color: Colors.redAccent),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _optionTile(String text, IconData icon, VoidCallback onTap,
-      {Color color = Colors.greenAccent}) {
-    return InkWell(
-      onTap: onTap,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 12),
-        child: Row(
-          children: [
-            Icon(icon, color: color),
-            const SizedBox(width: 12),
-            Text(text, style: TextStyle(color: color, fontSize: 16)),
           ],
         ),
       ),
@@ -534,14 +724,63 @@ class _ChatListScreenState extends State<ChatListScreen>
     }
   }
 
+  // ===================== HELPERS =====================
+  String _buildChatId(String a, String b) =>
+      a.compareTo(b) < 0 ? "${a}_$b" : "${b}_$a";
+
+  Future<bool> _isUnread(String chatId) async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool("chat_${chatId}_unread") ?? false;
+  }
+
 // ===================== UI =====================
   @override
   Widget build(BuildContext context) {
-    final allChats = [...unknownChats, ...chats]
-        .where((c) =>
-            c["name"]!.toUpperCase().contains(_search.toUpperCase()) ||
-            c["id"]!.toUpperCase().contains(_search.toUpperCase()))
+    
+    // 1. 🔥 FIX DUPLICATES: Create a Set of saved IDs
+    final savedIds = chats.map((c) => c['id']).toSet();
+
+    // 2. 🔥 FIX DUPLICATES: Only allow Unknowns that are NOT saved
+    final uniqueUnknowns = unknownChats
+        .where((c) => !savedIds.contains(c['id']))
         .toList();
+
+    // 3. Combine Lists
+    final allChats = [...uniqueUnknowns, ...chats];
+
+    // 4. Filter by Search
+    final filteredChats = allChats.where((c) =>
+        c["name"]!.toUpperCase().contains(_search.toUpperCase()) ||
+        c["id"]!.toUpperCase().contains(_search.toUpperCase())).toList();
+
+    // 5. Sort by Timestamp
+    filteredChats.sort((a, b) {
+      final chatIdA = _buildChatId(widget.myId, a["id"]!);
+      final chatIdB = _buildChatId(widget.myId, b["id"]!);
+
+      final tA = _lastMessageCache[chatIdA]?['timestamp'] as Timestamp?;
+      final tB = _lastMessageCache[chatIdB]?['timestamp'] as Timestamp?;
+
+      if (tA == null && tB == null) return 0;
+      if (tA == null) return 1; 
+      if (tB == null) return -1; 
+
+      return tB.compareTo(tA);
+    });
+
+    void copyMyId() {
+      Clipboard.setData(ClipboardData(text: widget.myId));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "My Pager ID Copied!",
+            style: TextStyle(color: Colors.black),
+          ),
+          backgroundColor: Colors.greenAccent,
+          duration: Duration(milliseconds: 800),
+        ),
+      );
+    }
 
     return Scaffold(
       backgroundColor: const Color(0xFF050505),
@@ -571,55 +810,59 @@ class _ChatListScreenState extends State<ChatListScreen>
             const SizedBox(height: 16),
 
             // ===================== HEADER =====================
-            Container(
-              margin: const EdgeInsets.symmetric(horizontal: 12),
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: const Color(0xFF0A0F0A),
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(
-                  color: Colors.greenAccent.withOpacity(0.9),
-                  width: 1.8,
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.greenAccent.withOpacity(0.25),
-                    blurRadius: 14,
-                    spreadRadius: 1,
+            GestureDetector(
+              onLongPress: copyMyId,
+              onSecondaryTap: copyMyId,
+              child: Container(
+                margin: const EdgeInsets.symmetric(horizontal: 12),
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0A0F0A),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                    color: Colors.greenAccent.withOpacity(0.9),
+                    width: 1.8,
                   ),
-                ],
-              ),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Column(
-                      children: [
-                        const Text(
-                          "PAGER CHAT",
-                          style: TextStyle(
-                            color: Colors.greenAccent,
-                            letterSpacing: 3,
-                            fontWeight: FontWeight.bold,
-                            fontFamily: 'monospace',
-                          ),
-                        ),
-                        const SizedBox(height: 6),
-                        Text(
-                          "PAGER ID: ${widget.myId}",
-                          style: TextStyle(
-                            color: Colors.greenAccent.withOpacity(0.6),
-                            fontSize: 12,
-                            fontFamily: 'monospace',
-                          ),
-                        ),
-                      ],
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.greenAccent.withOpacity(0.25),
+                      blurRadius: 14,
+                      spreadRadius: 1,
                     ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.logout, color: Colors.greenAccent),
-                    onPressed: _logout,
-                  )
-                ],
+                  ],
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        children: [
+                          const Text(
+                            "PAGER CHAT",
+                            style: TextStyle(
+                              color: Colors.greenAccent,
+                              letterSpacing: 3,
+                              fontWeight: FontWeight.bold,
+                              fontFamily: 'monospace',
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            "PAGER ID: ${widget.myId}",
+                            style: TextStyle(
+                              color: Colors.greenAccent.withOpacity(0.6),
+                              fontSize: 12,
+                              fontFamily: 'monospace',
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.logout, color: Colors.greenAccent),
+                      onPressed: _logout,
+                    )
+                  ],
+                ),
               ),
             ),
 
@@ -687,9 +930,9 @@ class _ChatListScreenState extends State<ChatListScreen>
               child: Container(
                 color: const Color(0xFF070B07),
                 child: ListView.builder(
-                  itemCount: allChats.length,
+                  itemCount: filteredChats.length,
                   itemBuilder: (_, index) {
-                    final chat = allChats[index];
+                    final chat = filteredChats[index];
                     final chatId = _buildChatId(widget.myId, chat["id"]!);
 
                     final isEven = index % 2 == 0;
@@ -698,9 +941,13 @@ class _ChatListScreenState extends State<ChatListScreen>
                         : const Color(0xFF0A140A);
 
                     final lastMsgData = _lastMessageCache[chatId];
-                    final lastMsg = lastMsgData != null 
+                    final lastMsg = lastMsgData != null
                         ? (lastMsgData['text'] ?? "NO MESSAGES")
                         : "NO MESSAGES";
+                    
+                    final timeLabel = lastMsgData != null 
+                        ? (lastMsgData['timeLabel'] ?? "") 
+                        : "";
 
                     return FutureBuilder(
                       future: _isUnread(chatId),
@@ -737,7 +984,8 @@ class _ChatListScreenState extends State<ChatListScreen>
                               ),
                               boxShadow: [
                                 BoxShadow(
-                                  color: Colors.greenAccent.withOpacity(0.08),
+                                  color:
+                                      Colors.greenAccent.withOpacity(0.08),
                                   blurRadius: 6,
                                   offset: const Offset(0, 2),
                                 ),
@@ -750,14 +998,33 @@ class _ChatListScreenState extends State<ChatListScreen>
                                     crossAxisAlignment:
                                         CrossAxisAlignment.start,
                                     children: [
-                                      Text(
-                                        chat["name"]!,
-                                        style: TextStyle(
-                                          color: Colors.greenAccent
-                                              .withOpacity(0.9),
-                                          fontWeight: FontWeight.bold,
-                                          fontFamily: 'monospace',
-                                        ),
+                                      Row(
+                                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                        children: [
+                                          Expanded(
+                                            child: Text(
+                                              chat["name"]!,
+                                              style: TextStyle(
+                                                color: Colors.greenAccent
+                                                    .withOpacity(0.9),
+                                                fontWeight: FontWeight.bold,
+                                                fontFamily: 'monospace',
+                                              ),
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                          ),
+                                          if (timeLabel.isNotEmpty)
+                                            Text(
+                                              timeLabel,
+                                              style: TextStyle(
+                                                color: Colors.greenAccent
+                                                    .withOpacity(0.5),
+                                                fontSize: 11,
+                                                fontFamily: 'monospace',
+                                                fontWeight: FontWeight.bold
+                                              ),
+                                            ),
+                                        ],
                                       ),
                                       const SizedBox(height: 6),
                                       Text(
@@ -774,7 +1041,8 @@ class _ChatListScreenState extends State<ChatListScreen>
                                     ],
                                   ),
                                 ),
-                                if (unread)
+                                if (unread) ...[
+                                  const SizedBox(width: 8),
                                   AnimatedBuilder(
                                     animation: _pulseAnim,
                                     builder: (_, __) => Container(
@@ -795,6 +1063,7 @@ class _ChatListScreenState extends State<ChatListScreen>
                                       ),
                                     ),
                                   ),
+                                ]
                               ],
                             ),
                           ),
