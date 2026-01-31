@@ -30,9 +30,7 @@
 
 | Login Screen | Chat List | Message Screen |
 |:---:|:---:|:---:|
-| <img width="611" height="1021" alt="image" src="https://github.com/user-attachments/assets/999a5186-40f4-4c29-b1c6-36c0216a46a8" />|
- | <img width="608" height="1022" alt="image" src="https://github.com/user-attachments/assets/a778ae1d-2302-40dd-ad83-66417b78a6fd" />|
- | *<img width="603" height="1029" alt="image" src="https://github.com/user-attachments/assets/6f17519e-4424-481a-905a-b0021193f043" />|
+| <img width="611" height="1021" alt="image" src="https://github.com/user-attachments/assets/999a5186-40f4-4c29-b1c6-36c0216a46a8" /> | <img width="608" height="1022" alt="image" src="https://github.com/user-attachments/assets/a778ae1d-2302-40dd-ad83-66417b78a6fd" /> | <img width="603" height="1029" alt="image" src="https://github.com/user-attachments/assets/6f17519e-4424-481a-905a-b0021193f043" /> |
 
 ---
 
@@ -88,3 +86,32 @@
 ### Android (APK)
 ```bash
 flutter build apk --release
+Output: build/app/outputs/flutter-apk/app-release.apk
+
+Windows (EXE)
+Bash
+flutter build windows --release
+Output: build/windows/x64/runner/Release/ (Copy the entire folder)
+
+Web (PWA)
+Bash
+flutter build web --release --web-renderer canvaskit
+Output: build/web/
+
+🤝 Contributing
+Contributions are welcome!
+
+Fork the Project
+
+Create your Feature Branch (git checkout -b feature/AmazingFeature)
+
+Commit your Changes (git commit -m 'Add some AmazingFeature')
+
+Push to the Branch (git push origin feature/AmazingFeature)
+
+Open a Pull Request
+
+📄 License
+Distributed under the MIT License. See LICENSE for more information.
+
+<div align="center"> <sub>Built with 💚 by Samuel Dileep</sub> </div>
